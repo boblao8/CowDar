@@ -125,21 +125,21 @@ struct ContentView: View {
 
         var body = Data()
 
-        // Append PLY file data
-        body.append("--\(boundary)\\r\\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\\"ply\\"; filename=\\"cow.ply\\"\\r\\n".data(using: .utf8)!)
-        body.append("Content-Type: application/octet-stream\\r\\n\\r\\n".data(using: .utf8)!)
+// Append PLY file data
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"ply\"; filename=\"cow.ply\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
         body.append(plyData)
-        body.append("\\r\\n".data(using: .utf8)!)
+        body.append("\r\n".data(using: .utf8)!)
 
         // Append Image file data
-        body.append("--\(boundary)\\r\\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\\"image\\"; filename=\\"cow.jpg\\"\\r\\n".data(using: .utf8)!)
-        body.append("Content-Type: image/jpeg\\r\\n\\r\\n".data(using: .utf8)!)
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"cow.jpg\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
         body.append(imageData)
-        body.append("\\r\\n".data(using: .utf8)!)
+        body.append("\r\n".data(using: .utf8)!)
 
-        body.append("--\(boundary)--\\r\\n".data(using: .utf8)!)
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
 
         request.httpBody = body
         return request
