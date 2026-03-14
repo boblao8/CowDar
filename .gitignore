@@ -1,0 +1,5 @@
+__pycache__/
+commands-dev-help/
+debug_images/
+debug_images_old/
+model.pt
