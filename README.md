@@ -14,11 +14,21 @@
 - simulatenously extracts a 3D LiDAR point cloud, a photo image, and phone intrinsic data (helps to calculate real life distances) from compatible iOS devices with LIDAR hardware
 - sends that data to a `fastapi` python server
     - the photo image is passed into a custom trained `yolov8m-pose` model with `100 epochs` using a dataset of labelled cow poses created by [Sorin Workspace](https://universe.roboflow.com/sorin-workspace/cow-pose-estimation-fxosp-4ac4b) of `1042` total images (`729` training, `209` validation, `104` testing) to analyse points of interest on the cow (approx 30 min on Nvidia T4)
-        - this model outputs a set of normalised coordinates (normalised refers to x,y coordinates from 0-1, as opposed to pixel measurements)
+        - this model outputs a set of normalised coordinates (normalised refers to a relative x,y value range of 0-1, as opposed to pixel measurements)
         - special note: point prediction is particularly difficult on angus cows due to their extremely dark skin colour, and we are currently experimenting with the model training and image pre processing to improve this
     - the 3D LiDAR point cloud is mathematically projected onto a 2D image plane
     - the server matches the normalised coordinates to the closest projected 3D LiDAR points to determine (estimate) the physical distance between points of interest on the cow
     - 3D euclidean distances are extracted between these coordinates (e.g., body length and radius)
     - weight is predicted using a variant of Schaeffer's Formula
 
-### development notes
+### endpoints
+- POST /api/tim/dist (with debug logs and debug image i/o)
+    - req: multi form, `image` jpg file, `ply` ply file
+    - res: json: ```json
+                    {
+                "success" : boolean,
+                "predictedWeight" : number,
+                "distPoint2To10" : number,
+                "distMidpointTo3" : number
+                }
+                ``` 
