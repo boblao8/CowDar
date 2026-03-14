@@ -123,6 +123,7 @@ struct ContentView: View {
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
+        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         var body = Data()
 
 // Append PLY file data
