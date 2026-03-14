@@ -97,7 +97,7 @@ struct ContentView: View {
 
             // Step C: Decode response
             let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase // To handle predictedWeight -> predicted_weight
+            // res using camelCase // decoder.keyDecodingStrategy = .convertFromSnakeCase // To handle predictedWeight -> predicted_weight
             let result = try decoder.decode(PredictionResponse.self, from: data)
             predictionResult = result
 
