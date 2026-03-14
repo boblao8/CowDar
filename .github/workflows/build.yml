@@ -30,8 +30,12 @@ jobs:
             -scheme "cowdar" \
             -project "cowdar.xcodeproj" \
             -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 15' \
-            -derivedDataPath build
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
 
       - name: Zip the .app bundle
         working-directory: ios-app/build/Build/Products/Debug-iphonesimulator

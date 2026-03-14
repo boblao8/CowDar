@@ -16,3 +16,6 @@ targets:
       INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
       INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
       GENERATE_INFOPLIST_FILE: YES
+      CODE_SIGN_IDENTITY: ""
+      CODE_SIGNING_REQUIRED: NO
+      CODE_SIGNING_ALLOWED: NO
