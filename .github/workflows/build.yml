@@ -1,0 +1,41 @@
+name: Cowdar
+
+on:
+  workflow_dispatch: 
+
+jobs:
+  build-for-simulator:
+    runs-on: macos-latest 
+
+    # This tells the cloud Mac to run all terminal commands inside your ios-app folder
+    defaults:
+      run:
+        working-directory: ./ios-app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build app for Simulator
+        run: |
+          xcodebuild clean build \
+            -scheme "cowdar" \
+            -project "cowdar.xcodeproj" \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -derivedDataPath build
+            
+      - name: Zip the .app bundle for Appetize
+        run: |
+          cd build/Build/Products/Debug-iphonesimulator/
+          zip -r SimulatorApp.zip "cowdar.app"
+
+      - name: Upload Artifact
+        # The upload action runs from the repo root, so we include 'ios-app' in the path here
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimulatorApp
+          path: ios-app/build/Build/Products/Debug-iphonesimulator/SimulatorApp.zip
