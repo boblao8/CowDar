@@ -1,23 +1,17 @@
-name: Cowdar
-
-on:
-  workflow_dispatch: 
-
-jobs:
-  build-for-simulator:
-    runs-on: macos-latest 
-
-    # This tells the cloud Mac to run all terminal commands inside your ios-app folder
-    defaults:
-      run:
-        working-directory: ./ios-app
-
-    steps:
+steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Select Xcode Version
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # --- NEW STEPS FOR XCODEGEN ---
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+      # ------------------------------
 
       - name: Build app for Simulator
         run: |
@@ -34,7 +28,6 @@ jobs:
           zip -r SimulatorApp.zip "cowdar.app"
 
       - name: Upload Artifact
-        # The upload action runs from the repo root, so we include 'ios-app' in the path here
         uses: actions/upload-artifact@v4
         with:
           name: SimulatorApp
