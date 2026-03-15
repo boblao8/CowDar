@@ -1,3 +1,4 @@
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 import math
 import json
 import os
@@ -268,3 +269,146 @@ async def get_tim_dist(
             os.remove(temp_img_path)
         if "temp_ply_path" in locals() and os.path.exists(temp_ply_path):
             os.remove(temp_ply_path)
+            
+
+@app.post("/api/av")
+async def get_av(
+    request:         Request,
+    photo:           UploadFile = File(...),
+    bin:             UploadFile = File(...),
+    depthX:          int        = Form(...),
+    depthY:          int        = Form(...),
+    referenceWidth:  float      = Form(...),
+    referenceHeight: float      = Form(...),
+    intrinsics:      str        = Form(...),
+):
+    print("\n[av] Request received")
+    img_ext = os.path.splitext(photo.filename)[1].lower() or ".jpg"
+    temp_img_path = None
+    temp_bin_path = None
+
+    try:
+        # 1. Save uploads to temp files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=img_ext) as tmp_img:
+            shutil.copyfileobj(photo.file, tmp_img)
+            temp_img_path = tmp_img.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp_bin:
+            shutil.copyfileobj(bin.file, tmp_bin)
+            temp_bin_path = tmp_bin.name
+
+        # 2. Detect keypoints
+        model = request.app.state.model
+        error, coords_data = getFourPOI(temp_img_path, model)
+        if error or not coords_data:
+            print("[av] Failed to detect required keypoints.")
+            return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+        # 3. Load the depth map
+        depth_map = np.frombuffer(open(temp_bin_path, "rb").read(), dtype=np.float32)
+        depth_map = depth_map.reshape((depthY, depthX))
+
+        # 4. Scale the intrinsics
+        K = json.loads(intrinsics)
+        fx, fy = K[0][0], K[1][1]
+        cx, cy = K[0][2], K[1][2]
+
+        fx_s = fx * (depthX / referenceWidth)
+        fy_s = fy * (depthY / referenceHeight)
+        cx_s = cx * (depthX / referenceWidth)
+        cy_s = cy * (depthY / referenceHeight)
+
+        # Helper: Look up a valid depth value
+        def find_valid_depth(depth_map, u, v, max_radius=10):
+            H, W = depth_map.shape
+            for r in range(max_radius + 1):
+                for dv in range(-r, r + 1):
+                    for du in range(-r, r + 1):
+                        if abs(du) != r and abs(dv) != r:
+                            continue
+                        nu, nv = u + du, v + dv
+                        if 0 <= nu < W and 0 <= nv < H:
+                            z = depth_map[nv, nu]
+                            if np.isfinite(z) and 0.0 < z < 100.0:
+                                return float(z)
+            return None
+
+        # 5, 6 & 7. Map keypoints, find valid depth, and back-project to 3D
+        pts = {}
+        target_keys = ["point_2", "point_10", "midpoint_2_10", "point_3"]
+        for key in target_keys:
+            # Map normalised keypoints to depth-map pixel coordinates
+            u = int(round(coords_data[key]["x"] * depthX))
+            v = int(round(coords_data[key]["y"] * depthY))
+            
+            # Clamp to valid range
+            u = max(0, min(depthX - 1, u))
+            v = max(0, min(depthY - 1, v))
+
+            # Look up valid Z
+            Z = find_valid_depth(depth_map, u, v)
+            if Z is None:
+                print(f"[av] No valid depth found for {key} within search radius.")
+                return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+            # Back-project to 3D
+            X = (u - cx_s) * Z / fx_s
+            Y = (v - cy_s) * Z / fy_s
+            pts[key] = np.array([X, Y, Z])
+
+        # 8. Calculate Euclidean distances
+        distPoint2To10  = float(np.linalg.norm(pts["point_2"]       - pts["point_10"]))
+        distMidpointTo3 = float(np.linalg.norm(pts["midpoint_2_10"] - pts["point_3"]))
+
+        # 9. Predict weight (metric Schaeffer's formula)
+        length_cm = distPoint2To10  * 100
+        radius_cm = distMidpointTo3 * 100
+        girth_cm  = radius_cm * 2 * math.pi
+        weight_kg = (length_cm * girth_cm ** 2) / 10400
+
+        # 10. Save a debug image
+        try:
+            with Image.open(temp_img_path) as debug_img:
+                photo_w, photo_h = debug_img.size
+                named_pixel_coords = {
+                    label: (coords_data[label]["x"] * photo_w, coords_data[label]["y"] * photo_h)
+                    for label in target_keys
+                }
+                save_debug_image(
+                    temp_img_path,
+                    named_pixel_coords,
+                    endpoint_name="av",
+                    original_filename=photo.filename or "upload",
+                    draw_lines=[("point_2", "point_10"), ("midpoint_2_10", "point_3")],
+                )
+        except Exception as e:
+            print(f"[av] Failed to save debug image: {e}")
+
+        print(f"[av] Done. Predicted Weight: {weight_kg:.2f} kg\n")
+
+        # 11. Return the response
+        return {
+            "success":         True,
+            "predictedWeight": round(float(weight_kg), 2),
+            "distPoint2To10":  round(float(distPoint2To10), 4),
+            "distMidpointTo3": round(float(distMidpointTo3), 4),
+        }
+
+    except Exception as e:
+        print(f"[av] Unhandled exception: {e}")
+        return {
+            "success": False, 
+            "predictedWeight": 0.0, 
+            "distPoint2To10": 0.0, 
+            "distMidpointTo3": 0.0
+        }
+
+    finally:
+        # Error handling and cleanup
+        for path_var in ("temp_img_path", "temp_bin_path"):
+            p = locals().get(path_var)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    print(f"[av] Failed to remove temp file {p}: {e}")
