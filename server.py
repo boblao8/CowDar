@@ -1,3 +1,7 @@
+
+from scipy.spatial import cKDTree
+from scipy.sparse import lil_matrix
+from scipy.sparse.csgraph import dijkstra
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 import math
 import json
@@ -675,19 +679,27 @@ async def api_get_3d_distances(
         predicted_weight_kg = 0.0
 
         if isinstance(dist_2_10, float) and isinstance(dist_mid_3, float):
-            girth_m   = dist_mid_3 * GIRTH_CIRCUMFERENCE_MULTIPLIER
-            length_in = dist_2_10 * 39.3701
-            girth_in  = girth_m   * 39.3701
+                # 1. Map physical lines to correct variables
+                body_length_m = dist_mid_3    # Horizontal line is length
+                chest_diameter_m = dist_2_10  # Vertical line is diameter
+                
+                # 2. Calculate Girth (Circumference = pi * diameter)
+                girth_m = chest_diameter_m * math.pi 
 
-            print(f'[Weight] length_in={length_in:.2f}"  girth_in={girth_in:.2f}"')
+                # 3. Convert to inches for Schaeffer's formula
+                length_in = body_length_m * 39.3701
+                girth_in  = girth_m * 39.3701
 
-            weight_lbs = (length_in * (girth_in ** 2)) / 300.0
-            weight_kg  = weight_lbs * 0.453592
+                print(f'[Weight] length_in={length_in:.2f}"  girth_in={girth_in:.2f}"')
 
-            print(f"[Weight] Schaffer raw: {weight_lbs:.1f} lb = {weight_kg:.1f} kg")
+                # 4. Schaeffer's Formula
+                weight_lbs = (length_in * (girth_in ** 2)) / 300.0
+                weight_kg  = weight_lbs * 0.453592
 
-            predicted_weight_kg = round(weight_kg * breed_mult * sex_mult, 1)
-            print(f"[Weight] After multipliers (x{breed_mult} x{sex_mult}): {predicted_weight_kg} kg")
+                print(f"[Weight] Schaffer raw: {weight_lbs:.1f} lb = {weight_kg:.1f} kg")
+
+                predicted_weight_kg = round(weight_kg * breed_mult * sex_mult, 1)
+                print(f"[Weight] After multipliers (x{breed_mult} x{sex_mult}): {predicted_weight_kg} kg")
         else:
             print(f"[Weight] Cannot compute -- dist_2_10={dist_2_10!r}  dist_mid_3={dist_mid_3!r}")
 
@@ -714,13 +726,45 @@ async def api_get_3d_distances(
                     print(f"Failed to delete temp file {path}: {e}")
                     
 
+from scipy.spatial import cKDTree
+from scipy.sparse import lil_matrix
+from scipy.sparse.csgraph import dijkstra
+
+def get_surface_path(start_idx, end_idx, points, graph):
+    dist_matrix, predecessors = dijkstra(
+        csgraph=graph,
+        directed=False,
+        indices=start_idx,
+        return_predecessors=True
+    )
+    total_dist = dist_matrix[end_idx]
+    if np.isinf(total_dist):
+        print(f"No path found between {start_idx} and {end_idx}")
+        return None
+
+    path_indices = []
+    current = end_idx
+    while current != start_idx:
+        path_indices.append(current)
+        current = predecessors[current]
+        if current == -9999:
+            print("Path reconstruction failed.")
+            return None
+    path_indices.append(start_idx)
+    path_indices = path_indices[::-1]
+
+    path_points = points[path_indices]
+    segment_distances = np.linalg.norm(path_points[1:] - path_points[:-1], axis=1)
+    return float(np.sum(segment_distances))
+
+
 @app.post("/api/reef/dist")
 async def get_reef_dist(
     request: Request,
     image: UploadFile = File(...),
     ply:   UploadFile = File(...),
 ):
-    print(f"\n[reef/dist] Request received (Pure NumPy Mode)")
+    print(f"\n[reef/dist] Request received (Curved Surface Distance Mode)")
     img_ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
 
     try:
@@ -741,68 +785,86 @@ async def get_reef_dist(
             print("[reef/dist] Failed to detect required keypoints.")
             return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
 
-        # 3. Load and Transform the PLY using NumPy
+        # 3. Load PLY
         try:
             points_3d = load_ply_points_numpy(temp_ply_path)
-            
             if points_3d.shape[0] == 0:
                 print("[reef/dist] PLY file contains no points.")
                 return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
-
-            # Step A: Move cloud so camera is at origin
-            closest_z = points_3d[:, 2].min()
-            points_3d -= np.array([0, 0, closest_z])
-
-            # Step B: Flip Z (bringing points in front of camera)
-            points_3d[:, 2] *= -1
-
-            # Step C: Rotate 90 degrees right (around Z axis)
-            theta = -np.pi / 2
-            Rz = np.array([
-                [np.cos(theta), -np.sin(theta), 0],
-                [np.sin(theta),  np.cos(theta), 0],
-                [0,              0,              1]
-            ])
-            points_3d = points_3d @ Rz.T
-
         except Exception as e:
-            print(f"[reef/dist] Failed to process point cloud: {e}")
+            print(f"[reef/dist] Failed to load point cloud: {e}")
             return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
 
-        # 4. Camera Intrinsics & Projection
+        # ---------------------------------------------------------
+        # 3.5 APPLY RELATIVE CAMERA TRANSFORMATIONS (The Fix)
+        # ---------------------------------------------------------
+        theta = -np.pi / 2
+        Rz = np.array([
+            [np.cos(theta), -np.sin(theta), 0],
+            [np.sin(theta),  np.cos(theta), 0],
+            [0,              0,             1]
+        ])
+        
+        # Apply rotation around Z
+        points_3d = points_3d @ Rz.T
+        
+        # Invert Z axis and mirror X axis
+        points_3d[:, 2] *= -1
+        points_3d[:, 0] *= -1
+
+        # 4. Project LiDAR → Image 
         image_width, image_height = 1920, 1440
         fx, fy = 1450, 1450
         cx, cy = image_width / 2, image_height / 2
 
-        # Use same projection logic as /api/tim/dist
         xs = points_3d[:, 0]
-        ys = -points_3d[:, 1]
-        zs = -points_3d[:, 2].copy()
-        zs[np.abs(zs) < 1e-6] = 1e-6 
+        ys = -points_3d[:, 1]          # flip vertical axis
+        zs = -points_3d[:, 2].copy()   # flip depth sign
+        zs[np.abs(zs) < 1e-6] = 1e-6
 
         u = fx * (xs / zs) + cx
         v = fy * (ys / zs) + cy
         projected_norm = np.column_stack((u / image_width, v / image_height))
 
-        # 5. Match YOLO 2D keypoints to transformed 3D points
-        matched_3d   = {}
-        target_keys  = ["point_2", "point_10", "midpoint_2_10", "point_3"]
+        # 5. Match YOLO 2D keypoints to 3D points
+        target_keys = ["point_2", "point_10", "midpoint_2_10", "point_3"]
+        matched_idx = {}
 
         for key in target_keys:
             target_pt = np.array([coords_data[key]["x"], coords_data[key]["y"]])
             dists     = np.linalg.norm(projected_norm - target_pt, axis=1)
-            best_idx  = np.argmin(dists)
-            matched_3d[key] = points_3d[best_idx]
+            matched_idx[key] = int(np.argmin(dists))
 
-        # 6. Calculate Euclidean Distances
-        dist_2_10  = float(np.linalg.norm(matched_3d["point_2"]       - matched_3d["point_10"]))
-        dist_mid_3 = float(np.linalg.norm(matched_3d["midpoint_2_10"] - matched_3d["point_3"]))
+        # 6. Build KNN graph for surface path
+        print("[reef/dist] Building KNN graph...")
+        k = 12
+        tree = cKDTree(points_3d)
+        dists_knn, nbrs_knn = tree.query(points_3d, k=k + 1)
 
-        # 7. Predict Weight
-        weight = ((dist_2_10 * 100) * (dist_mid_3 * 100 * 3.14159) ** 2) / 10840
+        n = len(points_3d)
+        graph = lil_matrix((n, n), dtype=np.float64)
+        for i in range(n):
+            for j_idx in range(1, k + 1):
+                j = nbrs_knn[i, j_idx]
+                d = dists_knn[i, j_idx]
+                graph[i, j] = d
+                graph[j, i] = d
 
-        # 8. Save Debug Output
-        # (Keeping your existing drawing logic...)
+        # 7. Compute curved surface distances via Dijkstra
+        print("[reef/dist] Computing surface paths...")
+        curved_d_2_10  = get_surface_path(matched_idx["point_2"],       matched_idx["point_10"], points_3d, graph)
+        curved_d_mid_3 = get_surface_path(matched_idx["midpoint_2_10"], matched_idx["point_3"],  points_3d, graph)
+
+        if curved_d_2_10 is None or curved_d_mid_3 is None:
+            print("[reef/dist] Surface path computation failed.")
+            return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+        # ---------------------------------------------------------
+        # 8. Predict weight using correct curved formula (The Fix)
+        # ---------------------------------------------------------
+        weight = 1.5 * ((curved_d_mid_3 * 100) * (curved_d_2_10 * 100 * 3.14159) ** 2) / 10840
+
+        # 9. Save Debug Output
         try:
             with Image.open(temp_img_path) as debug_img:
                 draw = ImageDraw.Draw(debug_img)
@@ -825,8 +887,8 @@ async def get_reef_dist(
         return {
             "success":         True,
             "predictedWeight": float(round(weight, 2)),
-            "distPoint2To10":  float(round(dist_2_10,  4)),
-            "distMidpointTo3": float(round(dist_mid_3, 4)),
+            "distPoint2To10":  float(round(curved_d_2_10,  4)),
+            "distMidpointTo3": float(round(curved_d_mid_3, 4)),
         }
 
     except Exception as e:

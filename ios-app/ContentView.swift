@@ -1,205 +1,232 @@
-
 import SwiftUI
+import UIKit
 
-// MARK: - API Response Codable Struct
-struct PredictionResponse: Codable {
-    let success: Bool
-    let predictedWeight: Double
-    let distPoint2To10: Double
-    let distMidpointTo3: Double
-}
-
-// MARK: - ContentView
 struct ContentView: View {
-    @State private var plyUrlString: String = "https://example.com/cow.ply" // Placeholder
-    @State private var imageUrlString: String = "https://example.com/cow.jpg" // Placeholder
-    @State private var isLoading: Bool = false
-    @State private var predictionResult: PredictionResponse?
-    @State private var errorMessage: String?
-
-    private let backendEndpoint = URL(string: "https://unintent-neida-pendanted.ngrok-free.dev/api/tim/dist")!
+    @StateObject private var settings = AppSettings.shared
+    @State private var sessions: [AnimalSession] = []
+    @State private var activeSession: AnimalSession? = nil
+    @State private var viewingSession: AnimalSession? = nil
+    @State private var showSettings = false
 
     var body: some View {
-        NavigationView {
-            Form {
-                Section("Input URLs") {
-                    TextField("PLY File URL", text: $plyUrlString)
-                        .keyboardType(.URL)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    TextField("Image File URL", text: $imageUrlString)
-                        .keyboardType(.URL)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                }
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-                Section {
-                    Button("Predict Weight") {
-                        Task {
-                            await predictWeight()
-                        }
+                VStack(spacing: 0) {
+                    logoHeader
+
+                    if sessions.isEmpty {
+                        emptyState
+                    } else {
+                        sessionList
                     }
-                    .disabled(isLoading)
-                }
 
-                if isLoading {
-                    ProgressView("Predicting...")
-                }
-
-                if let predictionResult = predictionResult {
-                    Section("Prediction Results") {
-                        ResultRow(label: "Success", value: predictionResult.success ? "Yes" : "No")
-                        ResultRow(label: "Predicted Weight", value: String(format: "%.2f kg", predictionResult.predictedWeight))
-                        ResultRow(label: "Distance P2 to P10", value: String(format: "%.4f m", predictionResult.distPoint2To10))
-                        ResultRow(label: "Distance Midpoint to P3", value: String(format: "%.4f m", predictionResult.distMidpointTo3))
-                    }
-                }
-
-                if let errorMessage = errorMessage {
-                    Section("Error") {
-                        Text(errorMessage)
-                            .foregroundColor(.red)
-                    }
+                    newAnimalButton
                 }
             }
-            .navigationTitle("Cow Weight Predictor")
+            .navigationBarHidden(true)
+            .onAppear {
+                reloadSessions()
+            }
+            .fullScreenCover(item: $activeSession) { session in
+                SessionCaptureView(session: session) {
+                    reloadSessions()
+                }
+            }
+            .fullScreenCover(item: $viewingSession) { session in
+                AnimalDetailView(session: session) {
+                    reloadSessions()
+                }
+            }
+            .fullScreenCover(isPresented: $showSettings) {
+                SettingsView()
+            }
         }
     }
 
-    // MARK: - Network Logic
-    private func predictWeight() async {
-        isLoading = true
-        errorMessage = nil
-        predictionResult = nil
+    private var logoHeader: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Spacer()
 
-        do {
-            guard let plyURL = URL(string: plyUrlString),
-                  let imageURL = URL(string: imageUrlString) else {
-                throw AppError.invalidURL
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.title3)
+                        .foregroundColor(.gray)
+                }
+                .padding(.trailing, 20)
             }
 
-            // Step A: Download files
-            let plyData = try await downloadFile(from: plyURL)
-            let imageData = try await downloadFile(from: imageURL)
+            Image("AppIcon")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 90, height: 90)
+                .cornerRadius(20)
+                .shadow(color: .cyan.opacity(0.4), radius: 12)
 
-            // Step B: Multipart Upload
-            let request = try createMultipartRequest(plyData: plyData, imageData: imageData)
-            let (data, response) = try await URLSession.shared.data(for: request)
+            Text("CattleScan")
+                .font(.system(size: 32, weight: .bold, design: .rounded))
+                .foregroundColor(.white)
 
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw AppError.networkError("Invalid HTTP response.")
+            Text("LiDAR Weight Estimation")
+                .font(.caption)
+                .foregroundColor(.cyan)
+                .tracking(1.5)
+                .textCase(.uppercase)
+
+            if !sessions.isEmpty {
+                Text("\(sessions.count) animal\(sessions.count == 1 ? "" : "s") recorded")
+                    .font(.caption2)
+                    .foregroundColor(.gray)
+                    .padding(.top, 2)
             }
-
-            if httpResponse.statusCode != 200 {
-                let responseBody = String(data: data, encoding: .utf8) ?? "No response body"
-                throw AppError.backendError("Backend error \(httpResponse.statusCode): \(responseBody)")
-            }
-
-            // Step C: Decode response
-            let decoder = JSONDecoder()
-            // res using camelCase // decoder.keyDecodingStrategy = .convertFromSnakeCase // To handle predictedWeight -> predicted_weight
-            let result = try decoder.decode(PredictionResponse.self, from: data)
-            predictionResult = result
-
-        } catch {
-            errorMessage = handleError(error)
         }
-        isLoading = false
+        .padding(.top, 30)
+        .padding(.bottom, 20)
     }
 
-    private func downloadFile(from url: URL) async throws -> Data {
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            return data
-        } catch {
-            throw AppError.downloadError("Failed to download file from \(url.lastPathComponent): \(error.localizedDescription)")
-        }
-    }
-
-    private func createMultipartRequest(plyData: Data, imageData: Data) throws -> URLRequest {
-        var request = URLRequest(url: backendEndpoint)
-        request.httpMethod = "POST"
-
-        let boundary = UUID().uuidString
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-
-        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-        var body = Data()
-
-// Append PLY file data
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"ply\"; filename=\"cow.ply\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
-        body.append(plyData)
-        body.append("\r\n".data(using: .utf8)!)
-
-        // Append Image file data
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"cow.jpg\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
-        body.append(imageData)
-        body.append("\r\n".data(using: .utf8)!)
-
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
-        request.httpBody = body
-        return request
-    }
-
-    private func handleError(_ error: Error) -> String {
-        if let appError = error as? AppError {
-            return appError.localizedDescription
-        } else {
-            return "An unexpected error occurred: \(error.localizedDescription)"
-        }
-    }
-}
-
-// MARK: - Helper Views
-struct ResultRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
+    private var emptyState: some View {
+        VStack(spacing: 16) {
             Spacer()
-            Text(value)
-                .foregroundColor(.secondary)
+
+            Image(systemName: "pawprint.circle")
+                .font(.system(size: 60))
+                .foregroundColor(.gray.opacity(0.4))
+
+            Text("No animals recorded yet")
+                .font(.headline)
+                .foregroundColor(.gray)
+
+            Text("Tap New Animal to start capturing")
+                .font(.caption)
+                .foregroundColor(.gray.opacity(0.6))
+
+            Spacer()
         }
+    }
+
+    private var sessionList: some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                ForEach(sessions) { session in
+                    SessionRowView(session: session) {
+                        viewingSession = session
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+        }
+    }
+
+    private var newAnimalButton: some View {
+        Button(action: startNewSession) {
+            HStack(spacing: 12) {
+                Image(systemName: "plus.circle.fill")
+                    .font(.title2)
+
+                Text("New Animal")
+                    .font(.title3.bold())
+            }
+            .foregroundColor(.black)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+            .background(
+                LinearGradient(
+                    colors: [.cyan, Color(red: 0, green: 0.9, blue: 0.6)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
+            .cornerRadius(16)
+            .padding(.horizontal, 20)
+        }
+        .padding(.bottom, 40)
+        .padding(.top, 12)
+    }
+
+    private func startNewSession() {
+        let session = AnimalSession(sessionNumber: AnimalSession.nextSessionNumber())
+        session.breed = settings.defaultBreed
+        session.sex = settings.defaultSex
+        session.location = settings.defaultLocation
+        session.save()
+        // Register before any other code can create a competing instance for
+        // this id (e.g. an immediate reloadSessions after the scan completes).
+        SessionStore.shared.register(session)
+        activeSession = session
+    }
+
+    private func reloadSessions() {
+        // Use the store so existing in-memory instances are reused — this
+        // keeps NetworkService's @Published mutations visible to any
+        // AnimalDetailView that is already open and observing a session.
+        sessions = SessionStore.shared.reload()
     }
 }
 
-// MARK: - Custom Error Types
-enum AppError: LocalizedError {
-    case invalidURL
-    case downloadError(String)
-    case networkError(String)
-    case backendError(String)
-    case decodingError(String)
-    case unknown
+struct SessionRowView: View {
+    let session: AnimalSession
+    let onTap: () -> Void
 
-    var errorDescription: String? {
-        switch self {
-        case .invalidURL:
-            return "One or both of the provided URLs are invalid."
-        case .downloadError(let message):
-            return "Download error: \(message)"
-        case .networkError(let message):
-            return "Network error: \(message)"
-        case .backendError(let message):
-            return "Backend error: \(message)"
-        case .decodingError(let message):
-            return "Data decoding error: \(message)"
-        case .unknown:
-            return "An unknown error occurred."
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 14) {
+                thumbnail
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.displayName)
+                        .font(.subheadline.bold())
+                        .foregroundColor(.white)
+
+                    Text(session.completionStatus)
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+
+                Spacer()
+
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(session.hasScan ? Color.cyan : Color.gray.opacity(0.3))
+                        .frame(width: 8, height: 8)
+
+                    Circle()
+                        .fill(session.hasWeight ? Color.orange : Color.gray.opacity(0.3))
+                        .frame(width: 8, height: 8)
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+            }
+            .padding(14)
+            .background(Color.white.opacity(0.07))
+            .cornerRadius(12)
         }
+        .buttonStyle(.plain)
     }
-}
 
-// MARK: - Preview
-struct ContentView_Previews: PreviewProvider {
-    static var previews: some View {
-        ContentView()
+    private var thumbnail: some View {
+        Group {
+            if let url = session.rgbCaptureURL(),
+               let image = UIImage(contentsOfFile: url.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.cyan.opacity(0.15))
+
+                    Image(systemName: "photo")
+                        .foregroundColor(.cyan)
+                }
+            }
+        }
+        .frame(width: 56, height: 56)
+        .clipped()
+        .cornerRadius(10)
     }
 }
