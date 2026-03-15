@@ -1,1 +1,11 @@
-[{'body': 'some View {\n        Text(', 'World!': ''}, {'previews': 'some View {\n        SampleView()'}]
+import SwiftUI
+
+struct SampleView: View {
+    var body: some View {
+        Text("Hello, World!")
+    }
+}
+
+#Preview {
+    SampleView()
+}
