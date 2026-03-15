@@ -6,7 +6,6 @@ import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime
-
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from ultralytics import YOLO
@@ -107,6 +106,26 @@ def save_debug_image(
     print(f"[Debug] Overlay saved -> {out_path}")
     return out_path
 
+def load_ply_points_numpy(ply_path: str) -> np.ndarray:
+    """Reads XYZ coordinates from an ASCII PLY file without using Open3D."""
+    points = []
+    with open(ply_path, "r") as f:
+        lines = f.readlines()
+        
+    try:
+        header_end = lines.index("end_header\n") + 1
+    except ValueError:
+        header_end = 0
+
+    for line in lines[header_end:]:
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            try:
+                points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            except ValueError:
+                continue
+                
+    return np.array(points)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -412,3 +431,410 @@ async def get_av(
                     os.remove(p)
                 except Exception as e:
                     print(f"[av] Failed to remove temp file {p}: {e}")
+                    
+def load_depth_map(depth_bin_path: str, depth_h: int, depth_w: int) -> np.ndarray:
+    expected_bytes = depth_h * depth_w * 4
+    actual_bytes   = os.path.getsize(depth_bin_path)
+
+    print(f"[DepthMap] Expected {expected_bytes}B ({depth_w}x{depth_h} x 4), got {actual_bytes}B")
+
+    if actual_bytes == expected_bytes:
+        depth_map = np.fromfile(depth_bin_path, dtype=np.float32).reshape((depth_h, depth_w))
+        print(f"[DepthMap] Loaded {depth_map.shape} (no padding)")
+
+    elif actual_bytes > expected_bytes and actual_bytes % depth_h == 0:
+        stride_bytes  = actual_bytes // depth_h
+        stride_floats = stride_bytes // 4
+        data      = np.fromfile(depth_bin_path, dtype=np.float32).reshape((depth_h, stride_floats))
+        depth_map = data[:, :depth_w]
+        print(f"[DepthMap] Stride {stride_bytes}B/row -> sliced to {depth_map.shape}")
+
+    else:
+        raise ValueError(
+            f"Depth file size mismatch: expected {expected_bytes}B for "
+            f"{depth_w}x{depth_h} float32 map, got {actual_bytes}B."
+        )
+
+    valid_mask = (depth_map > 0.0) & np.isfinite(depth_map)
+    valid_pct  = valid_mask.mean() * 100.0
+    print(
+        f"[DepthMap] min={depth_map[valid_mask].min():.3f}m  "
+        f"max={depth_map[valid_mask].max():.3f}m  "
+        f"mean={depth_map[valid_mask].mean():.3f}m  "
+        f"valid={valid_pct:.1f}%"
+    )
+
+    return depth_map
+
+
+def parse_info_file(info_path: str) -> tuple[float, float]:
+    try:
+        with open(info_path, "r") as f:
+            info = json.load(f)
+    except Exception as e:
+        print(f"[InfoFile] Could not parse: {e} -- using default multipliers")
+        return (1.0, 1.0)
+
+    breed = info.get("breed", "Other")
+    sex   = info.get("sex", "Other")
+
+    breed_mult = BREED_WEIGHT_MULTIPLIERS.get(breed, 1.0)
+    sex_mult   = SEX_WEIGHT_MULTIPLIERS.get(sex, 1.0)
+
+    print(f"[InfoFile] breed={breed!r} x{breed_mult}  sex={sex!r} x{sex_mult}")
+    return (breed_mult, sex_mult)
+
+
+def calculate_3d_coordinates(
+    norm_coords: dict,
+    depth_map: np.ndarray,
+    depth_h: int,
+    depth_w: int,
+    rgb_w: int,
+    rgb_h: int,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    search_radius: int = 5,
+) -> dict:
+    results_3d = {}
+
+    for point_name, coords in norm_coords.items():
+        u_norm, v_norm = coords["x"], coords["y"]
+
+        dx = min(int(u_norm * depth_w), depth_w - 1)
+        dy = min(int(v_norm * depth_h), depth_h - 1)
+        z  = float(depth_map[dy, dx])
+
+        used_fallback = False
+        if z <= 0.0 or not math.isfinite(z):
+            used_fallback = True
+            y0 = max(0, dy - search_radius)
+            y1 = min(depth_h - 1, dy + search_radius)
+            x0 = max(0, dx - search_radius)
+            x1 = min(depth_w - 1, dx + search_radius)
+            patch = depth_map[y0:y1 + 1, x0:x1 + 1]
+            valid = patch[(patch > 0.0) & np.isfinite(patch)]
+            if len(valid) > 0:
+                z = float(np.median(valid))
+            else:
+                print(
+                    f"[3D] {point_name}: depth invalid after {search_radius}px search "
+                    f"(norm=({u_norm:.3f},{v_norm:.3f}) depth_px=({dx},{dy}))"
+                )
+                results_3d[point_name] = {
+                    "valid": False,
+                    "error": f"Invalid depth after {search_radius}px search.",
+                }
+                continue
+
+        u_pixel = u_norm * rgb_w
+        v_pixel = v_norm * rgb_h
+        x_3d = (u_pixel - cx) * z / fx
+        y_3d = (v_pixel - cy) * z / fy
+
+        print(
+            f"[3D] {point_name}: norm=({u_norm:.4f},{v_norm:.4f}) "
+            f"depth_px=({dx},{dy}) z={z:.4f}m{' [fallback]' if used_fallback else ''} "
+            f"-> X={x_3d:.4f} Y={y_3d:.4f} Z={z:.4f}"
+        )
+
+        results_3d[point_name] = {
+            "valid": True,
+            "X": round(x_3d, 4),
+            "Y": round(y_3d, 4),
+            "Z": round(z,    4),
+        }
+
+    return results_3d
+
+
+def calc_distance(p1: dict, p2: dict) -> float | str:
+    if not p1 or not p2 or not p1.get("valid") or not p2.get("valid"):
+        return "Invalid (Missing Depth for one or both points)"
+    return round(
+        math.sqrt(
+            (p2["X"] - p1["X"]) ** 2 +
+            (p2["Y"] - p1["Y"]) ** 2 +
+            (p2["Z"] - p1["Z"]) ** 2
+        ),
+        4,
+    )
+    
+@app.post("/api/3d-distances")
+async def api_get_3d_distances(
+    request: Request,
+    image_file: UploadFile = File(...),
+    depth_file: UploadFile = File(...),
+    meta_file:  UploadFile = File(...),
+    info_file:  UploadFile = File(None),
+):
+    img_temp = depth_temp = meta_temp = info_temp = ""
+
+    print(f"\n[3D-Distances] Request received")
+    print(f"  image_file : {image_file.filename} ({image_file.content_type})")
+    print(f"  depth_file : {depth_file.filename}")
+    print(f"  meta_file  : {meta_file.filename}")
+    print(f"  info_file  : {info_file.filename if info_file else 'not provided'}")
+
+    try:
+        ext = os.path.splitext(image_file.filename)[1].lower() or ".jpg"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            shutil.copyfileobj(image_file.file, tmp)
+            img_temp = tmp.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+            shutil.copyfileobj(depth_file.file, tmp)
+            depth_temp = tmp.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+            shutil.copyfileobj(meta_file.file, tmp)
+            meta_temp = tmp.name
+
+        if info_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+                shutil.copyfileobj(info_file.file, tmp)
+                info_temp = tmp.name
+
+        print(
+            f"[3D-Distances] Saved: img={img_temp} ({os.path.getsize(img_temp)}B)  "
+            f"depth={depth_temp} ({os.path.getsize(depth_temp)}B)  "
+            f"meta={meta_temp} ({os.path.getsize(meta_temp)}B)"
+        )
+
+        try:
+            with open(meta_temp, "r") as f:
+                meta = json.load(f)
+
+            depth_w = int(meta["depthWidth"])
+            depth_h = int(meta["depthHeight"])
+            rgb_w   = int(meta["imageWidth"])
+            rgb_h   = int(meta["imageHeight"])
+            intrinsics = meta["intrinsics"]
+
+            # Intrinsics stored column-major from Swift simd_float3x3:
+            # [fx, 0, 0, 0, fy, 0, cx, cy, 1]
+            fx = float(intrinsics[0])
+            fy = float(intrinsics[4])
+            cx = float(intrinsics[6])
+            cy = float(intrinsics[7])
+
+            print(f"[Metadata] depth={depth_w}x{depth_h}  rgb={rgb_w}x{rgb_h}")
+            print(f"[Metadata] fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse metadata: {e}")
+
+        breed_mult, sex_mult = (1.0, 1.0)
+        if info_temp and os.path.exists(info_temp):
+            breed_mult, sex_mult = parse_info_file(info_temp)
+        else:
+            print("[InfoFile] Not provided -- using default multipliers (1.0 x 1.0)")
+
+        model = request.app.state.model
+        error, norm_coords = getFourPOI(img_temp, model)
+
+        if error:
+            raise HTTPException(status_code=500, detail="Failed to open or run inference on image.")
+
+        if not norm_coords:
+            print("[3D-Distances] YOLO could not detect required keypoints -- returning zero weight")
+            return {
+                "success":        False,
+                "predictedWeight": 0,
+                "distPoint2To10": -1,
+                "distMidpointTo3": -1,
+                "error": "YOLO could not detect cattle keypoints in the image.",
+            }
+
+        with Image.open(img_temp) as pil_img:
+            w, h = pil_img.size
+            named_px = {k: (v["x"] * w, v["y"] * h) for k, v in norm_coords.items()}
+        save_debug_image(
+            img_temp, named_px, "3d-distances", image_file.filename or "upload.jpg",
+            draw_lines=[("point_2", "point_10"), ("midpoint_2_10", "point_3")],
+        )
+
+        try:
+            depth_map = load_depth_map(depth_temp, depth_h, depth_w)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load depth map: {e}")
+
+        coords_3d = calculate_3d_coordinates(
+            norm_coords, depth_map, depth_h, depth_w, rgb_w, rgb_h, fx, fy, cx, cy,
+        )
+
+        dist_2_10  = calc_distance(coords_3d.get("point_2"),       coords_3d.get("point_10"))
+        dist_mid_3 = calc_distance(coords_3d.get("midpoint_2_10"), coords_3d.get("point_3"))
+
+        print(f"[Weight] dist_2_10  (body length) = {dist_2_10}")
+        print(f"[Weight] dist_mid_3 (body radius) = {dist_mid_3}")
+
+        predicted_weight_kg = 0.0
+
+        if isinstance(dist_2_10, float) and isinstance(dist_mid_3, float):
+            girth_m   = dist_mid_3 * GIRTH_CIRCUMFERENCE_MULTIPLIER
+            length_in = dist_2_10 * 39.3701
+            girth_in  = girth_m   * 39.3701
+
+            print(f'[Weight] length_in={length_in:.2f}"  girth_in={girth_in:.2f}"')
+
+            weight_lbs = (length_in * (girth_in ** 2)) / 300.0
+            weight_kg  = weight_lbs * 0.453592
+
+            print(f"[Weight] Schaffer raw: {weight_lbs:.1f} lb = {weight_kg:.1f} kg")
+
+            predicted_weight_kg = round(weight_kg * breed_mult * sex_mult, 1)
+            print(f"[Weight] After multipliers (x{breed_mult} x{sex_mult}): {predicted_weight_kg} kg")
+        else:
+            print(f"[Weight] Cannot compute -- dist_2_10={dist_2_10!r}  dist_mid_3={dist_mid_3!r}")
+
+        print("[3D-Distances] Done\n")
+
+        return {
+            "success":         True,
+            "predictedWeight": predicted_weight_kg,
+            "distPoint2To10":  dist_2_10  if isinstance(dist_2_10,  float) else -1,
+            "distMidpointTo3": dist_mid_3 if isinstance(dist_mid_3, float) else -1,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[3D-Distances] Unhandled exception: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for path in [img_temp, depth_temp, meta_temp, info_temp]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    print(f"Failed to delete temp file {path}: {e}")
+                    
+
+@app.post("/api/reef/dist")
+async def get_reef_dist(
+    request: Request,
+    image: UploadFile = File(...),
+    ply:   UploadFile = File(...),
+):
+    print(f"\n[reef/dist] Request received (Pure NumPy Mode)")
+    img_ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
+
+    try:
+        # 1. Save uploads to temporary files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=img_ext) as tmp_img:
+            shutil.copyfileobj(image.file, tmp_img)
+            temp_img_path = tmp_img.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ply") as tmp_ply:
+            shutil.copyfileobj(ply.file, tmp_ply)
+            temp_ply_path = tmp_ply.name
+
+        # 2. Extract keypoints via YOLO
+        model = request.app.state.model
+        error, coords_data = getFourPOI(temp_img_path, model)
+
+        if error or not coords_data:
+            print("[reef/dist] Failed to detect required keypoints.")
+            return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+        # 3. Load and Transform the PLY using NumPy
+        try:
+            points_3d = load_ply_points_numpy(temp_ply_path)
+            
+            if points_3d.shape[0] == 0:
+                print("[reef/dist] PLY file contains no points.")
+                return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+            # Step A: Move cloud so camera is at origin
+            closest_z = points_3d[:, 2].min()
+            points_3d -= np.array([0, 0, closest_z])
+
+            # Step B: Flip Z (bringing points in front of camera)
+            points_3d[:, 2] *= -1
+
+            # Step C: Rotate 90 degrees right (around Z axis)
+            theta = -np.pi / 2
+            Rz = np.array([
+                [np.cos(theta), -np.sin(theta), 0],
+                [np.sin(theta),  np.cos(theta), 0],
+                [0,              0,              1]
+            ])
+            points_3d = points_3d @ Rz.T
+
+        except Exception as e:
+            print(f"[reef/dist] Failed to process point cloud: {e}")
+            return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+        # 4. Camera Intrinsics & Projection
+        image_width, image_height = 1920, 1440
+        fx, fy = 1450, 1450
+        cx, cy = image_width / 2, image_height / 2
+
+        # Use same projection logic as /api/tim/dist
+        xs = points_3d[:, 0]
+        ys = -points_3d[:, 1]
+        zs = -points_3d[:, 2].copy()
+        zs[np.abs(zs) < 1e-6] = 1e-6 
+
+        u = fx * (xs / zs) + cx
+        v = fy * (ys / zs) + cy
+        projected_norm = np.column_stack((u / image_width, v / image_height))
+
+        # 5. Match YOLO 2D keypoints to transformed 3D points
+        matched_3d   = {}
+        target_keys  = ["point_2", "point_10", "midpoint_2_10", "point_3"]
+
+        for key in target_keys:
+            target_pt = np.array([coords_data[key]["x"], coords_data[key]["y"]])
+            dists     = np.linalg.norm(projected_norm - target_pt, axis=1)
+            best_idx  = np.argmin(dists)
+            matched_3d[key] = points_3d[best_idx]
+
+        # 6. Calculate Euclidean Distances
+        dist_2_10  = float(np.linalg.norm(matched_3d["point_2"]       - matched_3d["point_10"]))
+        dist_mid_3 = float(np.linalg.norm(matched_3d["midpoint_2_10"] - matched_3d["point_3"]))
+
+        # 7. Predict Weight
+        weight = ((dist_2_10 * 100) * (dist_mid_3 * 100 * 3.14159) ** 2) / 10840
+
+        # 8. Save Debug Output
+        # (Keeping your existing drawing logic...)
+        try:
+            with Image.open(temp_img_path) as debug_img:
+                draw = ImageDraw.Draw(debug_img)
+                w, h = debug_img.size
+                px_2   = (int(coords_data["point_2"]["x"]       * w), int(coords_data["point_2"]["y"]       * h))
+                px_10  = (int(coords_data["point_10"]["x"]      * w), int(coords_data["point_10"]["y"]      * h))
+                px_mid = (int(coords_data["midpoint_2_10"]["x"] * w), int(coords_data["midpoint_2_10"]["y"] * h))
+                px_3   = (int(coords_data["point_3"]["x"]       * w), int(coords_data["point_3"]["y"]       * h))
+
+                draw.line([px_2, px_10],  fill="red",  width=8)
+                draw.line([px_mid, px_3], fill="blue", width=8)
+                for px in [px_2, px_10, px_mid, px_3]:
+                    draw.ellipse((px[0] - 10, px[1] - 10, px[0] + 10, px[1] + 10), fill="yellow")
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                debug_img.save(os.path.join(DEBUG_IMAGE_DIR, f"reef_dist_weight_{timestamp}.jpg"))
+        except Exception as e:
+            print(f"[reef/dist] Failed to save debug image: {e}")
+
+        return {
+            "success":         True,
+            "predictedWeight": float(round(weight, 2)),
+            "distPoint2To10":  float(round(dist_2_10,  4)),
+            "distMidpointTo3": float(round(dist_mid_3, 4)),
+        }
+
+    except Exception as e:
+        print(f"[reef/dist] Unhandled exception: {e}")
+        return {"success": False, "predictedWeight": 0, "distPoint2To10": 0, "distMidpointTo3": 0}
+
+    finally:
+        if "temp_img_path" in locals() and os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
+        if "temp_ply_path" in locals() and os.path.exists(temp_ply_path):
+            os.remove(temp_ply_path)

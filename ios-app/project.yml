@@ -6,7 +6,7 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
-    sources: 
+    sources:
       - path: .
         excludes:
           - project.yml
@@ -19,3 +19,4 @@ targets:
       CODE_SIGN_IDENTITY: ""
       CODE_SIGNING_REQUIRED: NO
       CODE_SIGNING_ALLOWED: NO
+      INFOPLIST_KEY_NSCameraUsageDescription: "Used to capture photos for cow weight estimation"

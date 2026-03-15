@@ -4,7 +4,9 @@ import SwiftUI
 struct CowdarApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            NavigationStack {  // ← required here
+                CameraView()
+            }
         }
     }
 }
