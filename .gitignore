@@ -3,3 +3,4 @@ commands-dev-help/
 debug_images/
 debug_images_old/
 model.pt
+old_server_fns
