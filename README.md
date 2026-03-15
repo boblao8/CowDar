@@ -10,6 +10,16 @@
         - note: most research on this topic often involves complex algorithms and data pipelines
         - the current scope of the projected and our limited skillset has been a limiting factor in taking advantage of this, and our predictions are not as accurate as state of the art approaches, but can be improved over time
 
+### Hardware Requirements
+CowDar requires an IOS device equipped with LiDAR capability, such as:
+- iPhone 12 Pro / Pro Max
+- iPhone 13 Pro / Pro Max
+- iPhone 14 Pro / Pro Max
+- iPhone 15 Pro / Pro Max
+- iPhone 16 Pro / Pro Max
+- iPhone 17 Pro / Pro Max
+- iPad Pro (2020+)
+
 ### current approach
 - simulatenously extracts a 3D LiDAR point cloud, a photo image, and phone intrinsic data (helps to calculate real life distances) from compatible iOS devices with LIDAR hardware
 - sends that data to a `fastapi` python server
@@ -31,4 +41,13 @@
                 "distPoint2To10" : number,
                 "distMidpointTo3" : number
                 }
-                ``` 
+                ```
+
+### Limitations
+- Dataset used to train the cow pose model
+    - The YOLO cow pose model was trained on a relatively small dataset (1042 labelled images). A larger dataset would likely result in more accurate and consistent keypoint detection.
+- The formula used to estimate the mass of the cow (Schaeffer's formula) is a simplified model which does not take into account various factors such as breed, age, sex etc.
+- LiDAR sensor accuracy
+    - The system relies on the mobile device's LiDAR sensor to estimate real-world distances. Consumer grade LiDAR sensors can produce noisy or incomplete point clouds depending on lighting conditions, distance from the subject and the colour and reflectivity of the animal's coat. During testing, the data primarily consisted of Angus cattle, whose dark coats can reduce LiDAR reflectivity and make depth perception less reliable in some cases.
+- Evaluation scope
+    - The system has only been tested on small number of real-world scans and has not been evaluated under a large and diverse dataset (e.g. different cattle breeds). Future work will involve testing across a wider range of breeds, environments and scanning conditions to better evaluate the accuracy and robustness of the system. 
